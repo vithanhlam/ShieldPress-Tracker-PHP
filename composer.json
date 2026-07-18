@@ -1,0 +1,51 @@
+{
+    "name": "shieldpress/tracker-php",
+    "description": "Website tracking, monitoring & security SDK for PHP — Laravel, Symfony, Slim, and vanilla PHP. Reports metrics to ShieldPress.",
+    "version": "1.0.0",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "shieldpress",
+        "monitoring",
+        "tracking",
+        "security",
+        "laravel",
+        "php",
+        "apm",
+        "uptime",
+        "performance"
+    ],
+    "authors": [
+        {
+            "name": "ShieldPress",
+            "email": "hello@shieldpress.net"
+        }
+    ],
+    "require": {
+        "php": ">=7.4",
+        "ext-json": "*",
+        "ext-curl": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^9.0|^10.0|^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "ShieldPress\\Tracker\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "ShieldPress\\Tracker\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "ShieldPress\\Tracker\\Laravel\\ShieldPressServiceProvider"
+            ]
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
