@@ -1,7 +1,7 @@
 {
     "name": "shieldpress/tracker-php",
     "description": "Website tracking, monitoring & security SDK for PHP — Laravel, Symfony, Slim, and vanilla PHP. Reports metrics to ShieldPress.",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "type": "library",
     "license": "MIT",
     "keywords": [
