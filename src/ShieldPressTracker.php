@@ -89,15 +89,17 @@ class ShieldPressTracker
     /**
      * Get or create singleton instance.
      *
-     * @param array<string, mixed>|null $config Required on first call
+     * Config can be passed as array, or auto-detected from ENV vars:
+     *   SHIELDPRESS_API_KEY, SHIELDPRESS_SITE_ID, SHIELDPRESS_API_URL,
+     *   SHIELDPRESS_APP_NAME, SHIELDPRESS_APP_VERSION, SHIELDPRESS_DEBUG
+     *
+     * @param array<string, mixed>|null $config Pass null to auto-detect from ENV
      */
     public static function getInstance(?array $config = null): self
     {
         if (self::$instance === null) {
-            if ($config === null) {
-                throw new \RuntimeException('[ShieldPress] Tracker not initialized. Call getInstance() with config first.');
-            }
-            self::$instance = new self($config);
+            // Allow auto-detection from ENV (no config needed)
+            self::$instance = new self($config ?? []);
         }
 
         return self::$instance;
