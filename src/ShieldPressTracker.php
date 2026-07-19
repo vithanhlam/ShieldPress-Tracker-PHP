@@ -441,6 +441,12 @@ class ShieldPressTracker
     {
         $self = $this;
         $previousHandler = set_error_handler(function (int $errno, string $errstr, string $errfile, int $errline) use (&$previousHandler, $self): bool {
+            // Skip errors suppressed with @ operator — error_reporting() returns 0
+            // when @ is active (PHP 7.x) or only E_ERROR (PHP 8.0+)
+            if (!(error_reporting() & $errno)) {
+                return false;
+            }
+
             $self->errorCollector->capture($errstr, [
                 'file'  => $errfile,
                 'line'  => $errline,

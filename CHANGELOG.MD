@@ -1,5 +1,30 @@
 # Changelog — shieldpress/tracker-php
 
+## [1.1.3] — 2026-07-19
+
+### Fixed
+- **Disk collection**: Removed `isPathAllowed()` pre-check that blocked `disk_total_space()`/`disk_free_space()` on restricted hosting. These PHP functions often work even when the path is not in `open_basedir`.
+- **RAM collection**: Removed `safeIsReadable('/proc/meminfo')` pre-check. Now reads `/proc/meminfo` directly — kernel virtual files are accessible on most Linux hosting regardless of `open_basedir`.
+- **CPU collection**: Removed `safeIsReadable('/proc/stat')` pre-check. Same reason as RAM.
+- **CPU cores**: Removed `safeIsReadable('/proc/cpuinfo')` pre-check.
+- **OS detection**: Removed `safeIsReadable('/etc/os-release')` pre-check.
+- **Error handler**: Added `!(error_reporting() & $errno)` check to skip `@`-suppressed warnings. Fixes `disk_total_space(): open_basedir restriction` being captured into ErrorCollector.
+
+### Added
+- **3-tier disk fallback**: PHP native → `shell_exec` (wmic/df/PowerShell) → `exec()` fallback.
+- **3-tier RAM fallback**: `/proc/meminfo` → `shell_exec('free -b')` → `exec('free -b')`. Windows: wmic → PowerShell → exec.
+- **3-tier CPU fallback**: `/proc/stat` → `shell_exec('mpstat'/'top')` → `exec('cat /proc/stat')`. Windows: wmic → PowerShell → exec.
+- **`disable_functions` aware**: Checks `ini_get('disable_functions')` before attempting `shell_exec`/`exec` calls.
+- **`diskPath` field**: Reports which method was used to obtain disk metrics (e.g., `/`, `wmic`, `exec:wmic`, `df:/`, `powershell`).
+- **PowerShell fallback**: For Windows environments where `wmic` is deprecated (Windows 11+/Server 2025).
+- **More disk paths**: Tries `DOCUMENT_ROOT`, `ABSPATH`, `sys_get_temp_dir()` in addition to `/` and `__DIR__`.
+
+### Compatibility
+- Tested on: PHP 7.4 - 8.4, Windows/Linux/macOS
+- Works with: `open_basedir` restriction, `disable_functions` (disk/shell_exec/exec), shared hosting environments
+
+---
+
 ## [1.1.0] — 2026-07-19
 
 ### Fixed

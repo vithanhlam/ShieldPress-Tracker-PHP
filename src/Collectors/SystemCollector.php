@@ -102,31 +102,18 @@ class SystemCollector
                 $errors[] = 'cpu_percent_unavailable';
             }
 
-            // Disk usage — try multiple paths for open_basedir compatibility
-            $diskPaths = PHP_OS_FAMILY === 'Windows'
-                ? [$this->getWindowsDiskRoot()]
-                : ['/', __DIR__, sys_get_temp_dir()];
-
-            $diskTotal = false;
-            $diskFree  = false;
-            foreach ($diskPaths as $tryPath) {
-                if (!$this->isPathAllowed($tryPath)) {
-                    continue;
-                }
-                $diskTotal = @disk_total_space($tryPath);
-                $diskFree  = @disk_free_space($tryPath);
-                if ($diskTotal !== false && $diskFree !== false) {
-                    break;
-                }
-            }
-
-            if ($diskTotal !== false && $diskFree !== false) {
-                $diskUsed = max(0, $diskTotal - $diskFree);
-                $metrics['diskTotalGb'] = round($diskTotal / 1073741824, 2);
-                $metrics['diskUsedGb']  = round($diskUsed / 1073741824, 2);
-                $metrics['diskPercent'] = $diskTotal > 0 ? round(($diskUsed / $diskTotal) * 100, 2) : 0.0;
+            // Disk usage — robust cross-platform collection
+            $diskInfo = $this->getDiskUsage();
+            if ($diskInfo['total'] !== null) {
+                $metrics['diskTotalGb'] = $diskInfo['total'];
+                $metrics['diskUsedGb']  = $diskInfo['used'];
+                $metrics['diskPercent'] = $diskInfo['percent'];
+                $metrics['diskPath']    = $diskInfo['path'];
             } else {
                 $errors[] = 'disk_space_unavailable';
+                if (!empty($diskInfo['reason'])) {
+                    $errors[] = 'disk_reason:' . $diskInfo['reason'];
+                }
             }
 
             // OPcache hit rate
@@ -232,7 +219,7 @@ class SystemCollector
             }
         }
 
-        if (PHP_OS_FAMILY === 'Linux' && $this->safeIsReadable('/proc/cpuinfo')) {
+        if (PHP_OS_FAMILY === 'Linux') {
             $cpuinfo = @file_get_contents('/proc/cpuinfo');
             if ($cpuinfo !== false) {
                 return max(1, substr_count($cpuinfo, 'processor'));
@@ -262,36 +249,58 @@ class SystemCollector
             return 0.0;
         }
 
-        // Try /proc/stat first
-        if ($this->safeIsReadable('/proc/stat')) {
-            $stat = @file_get_contents('/proc/stat');
-            if ($stat !== false) {
-                $lines = explode("\n", $stat);
-                foreach ($lines as $line) {
-                    if (strpos($line, 'cpu ') === 0) {
-                        $parts = preg_split('/\s+/', trim($line));
-                        if ($parts === false || count($parts) < 5) {
-                            return 0.0;
-                        }
-                        $busy  = (int) $parts[1] + (int) $parts[2] + (int) $parts[3];
-                        $idle  = (int) $parts[4];
-                        $total = $busy + $idle;
-                        if ($total === 0) {
-                            return 0.0;
-                        }
-                        return round(($busy / $total) * 100, 2);
+        $disabled = $this->getDisabledFunctions();
+
+        // Try /proc/stat directly (don't pre-check open_basedir — /proc is
+        // a kernel virtual filesystem often accessible regardless)
+        $stat = @file_get_contents('/proc/stat');
+        if ($stat !== false) {
+            $lines = explode("\n", $stat);
+            foreach ($lines as $line) {
+                if (strpos($line, 'cpu ') === 0) {
+                    $parts = preg_split('/\s+/', trim($line));
+                    if ($parts === false || count($parts) < 5) {
+                        break;
                     }
+                    $busy  = (int) $parts[1] + (int) $parts[2] + (int) $parts[3];
+                    $idle  = (int) $parts[4];
+                    $total = $busy + $idle;
+                    if ($total === 0) {
+                        break;
+                    }
+                    return round(($busy / $total) * 100, 2);
                 }
             }
         }
 
-        // Fallback: use 'top' or 'mpstat' command
-        if (function_exists('shell_exec')) {
-            // Try mpstat
+        // Fallback: mpstat command
+        if (function_exists('shell_exec') && !in_array('shell_exec', $disabled, true)) {
             $output = @shell_exec('mpstat 1 1 2>/dev/null | tail -1');
             if ($output !== null && preg_match('/([\d.]+)\s*$/', trim($output), $m)) {
                 $idle = (float) $m[1];
                 return round(100 - $idle, 2);
+            }
+            // Try top -bn1
+            $output = @shell_exec("top -bn1 2>/dev/null | grep 'Cpu(s)'");
+            if ($output !== null && preg_match('/([\d.]+)\s*id/', $output, $m)) {
+                return round(100 - (float) $m[1], 2);
+            }
+        }
+
+        // Fallback: exec()
+        if (function_exists('exec') && !in_array('exec', $disabled, true)) {
+            $output = [];
+            @exec('cat /proc/stat 2>/dev/null | head -1', $output);
+            if (!empty($output) && strpos($output[0], 'cpu ') === 0) {
+                $parts = preg_split('/\s+/', trim($output[0]));
+                if ($parts !== false && count($parts) >= 5) {
+                    $busy  = (int) $parts[1] + (int) $parts[2] + (int) $parts[3];
+                    $idle  = (int) $parts[4];
+                    $total = $busy + $idle;
+                    if ($total > 0) {
+                        return round(($busy / $total) * 100, 2);
+                    }
+                }
             }
         }
 
@@ -300,23 +309,328 @@ class SystemCollector
 
     private function getWindowsCpuPercent(): float
     {
-        if (!function_exists('shell_exec')) {
-            return 0.0;
+        $disabled = $this->getDisabledFunctions();
+
+        if (function_exists('shell_exec') && !in_array('shell_exec', $disabled, true)) {
+            $output = @shell_exec('wmic cpu get LoadPercentage /value 2>NUL');
+            if ($output !== null && preg_match('/LoadPercentage=(\d+)/', $output, $m)) {
+                return (float) $m[1];
+            }
+            // PowerShell fallback (wmic deprecated in newer Windows)
+            $output = @shell_exec('powershell -NoProfile -Command "(Get-CimInstance Win32_Processor).LoadPercentage" 2>NUL');
+            if ($output !== null && is_numeric(trim($output))) {
+                return (float) trim($output);
+            }
         }
-        $output = @shell_exec('wmic cpu get LoadPercentage /value 2>NUL');
-        if ($output !== null && preg_match('/LoadPercentage=(\d+)/', $output, $m)) {
-            return (float) $m[1];
+
+        if (function_exists('exec') && !in_array('exec', $disabled, true)) {
+            $output = [];
+            @exec('wmic cpu get LoadPercentage /value 2>NUL', $output);
+            $raw = implode("\n", $output);
+            if (preg_match('/LoadPercentage=(\d+)/', $raw, $m)) {
+                return (float) $m[1];
+            }
         }
+
         return 0.0;
+    }
+
+    /**
+     * Get disk usage — tries PHP native functions first, then OS-level commands as fallback.
+     * Works across Linux, macOS, Windows, and restricted hosting (open_basedir, disabled functions).
+     *
+     * @return array{total: float|null, used: float|null, percent: float, path: string, reason: string}
+     */
+    private function getDiskUsage(): array
+    {
+        $result = ['total' => null, 'used' => null, 'percent' => 0.0, 'path' => '', 'reason' => ''];
+
+        // Check if disk functions are disabled
+        $disabled = $this->getDisabledFunctions();
+        $hasDiskFunctions = !in_array('disk_total_space', $disabled, true)
+                         && !in_array('disk_free_space', $disabled, true);
+
+        // Strategy 1: PHP native disk_total_space / disk_free_space
+        if ($hasDiskFunctions) {
+            $paths = $this->getDiskPaths();
+            foreach ($paths as $tryPath) {
+                if ($tryPath === '' || $tryPath === null) {
+                    continue;
+                }
+                // Call directly with @ — don't pre-check open_basedir because
+                // disk functions often work even when path isn't in open_basedir list
+                $total = @disk_total_space($tryPath);
+                $free  = @disk_free_space($tryPath);
+                if ($total !== false && $total > 0 && $free !== false) {
+                    $used = max(0, $total - $free);
+                    $result['total']   = round($total / 1073741824, 2);
+                    $result['used']    = round($used / 1073741824, 2);
+                    $result['percent'] = round(($used / $total) * 100, 2);
+                    $result['path']    = $tryPath;
+                    return $result;
+                }
+            }
+        }
+
+        // Strategy 2: OS-level command fallback (for restricted PHP environments)
+        if (function_exists('shell_exec') && !in_array('shell_exec', $disabled, true)) {
+            $cmdResult = $this->getDiskUsageFromCommand();
+            if ($cmdResult !== null) {
+                $result['total']   = $cmdResult['total'];
+                $result['used']    = $cmdResult['used'];
+                $result['percent'] = $cmdResult['percent'];
+                $result['path']    = $cmdResult['path'];
+                return $result;
+            }
+        }
+
+        // Strategy 3: exec() fallback if shell_exec is disabled
+        if (function_exists('exec') && !in_array('exec', $disabled, true)) {
+            $cmdResult = $this->getDiskUsageFromExec();
+            if ($cmdResult !== null) {
+                $result['total']   = $cmdResult['total'];
+                $result['used']    = $cmdResult['used'];
+                $result['percent'] = $cmdResult['percent'];
+                $result['path']    = $cmdResult['path'];
+                return $result;
+            }
+        }
+
+        // All strategies failed
+        $result['reason'] = $hasDiskFunctions ? 'all_paths_failed' : 'disk_functions_disabled';
+        return $result;
+    }
+
+    /**
+     * Get ordered list of paths to try for disk space measurement.
+     *
+     * @return array<string>
+     */
+    private function getDiskPaths(): array
+    {
+        if (PHP_OS_FAMILY === 'Windows') {
+            $paths = [];
+            // Primary: drive root from current working dir or known paths
+            $paths[] = $this->getWindowsDiskRoot();
+            // Fallback: current script directory drive
+            $scriptDrive = $this->extractDriveLetter(__DIR__);
+            if ($scriptDrive !== '' && !in_array($scriptDrive, $paths, true)) {
+                $paths[] = $scriptDrive;
+            }
+            // Fallback: temp directory
+            $tmp = sys_get_temp_dir();
+            $tmpDrive = $this->extractDriveLetter($tmp);
+            if ($tmpDrive !== '' && !in_array($tmpDrive, $paths, true)) {
+                $paths[] = $tmpDrive;
+            }
+            // Last resort
+            if (!in_array('C:\\', $paths, true)) {
+                $paths[] = 'C:\\';
+            }
+            return $paths;
+        }
+
+        // Unix/Linux/macOS — ordered by likelihood of success
+        $paths = ['/'];
+
+        // Current script directory (almost always accessible)
+        if (__DIR__ !== '/') {
+            $paths[] = __DIR__;
+        }
+
+        // Temp directory
+        $tmp = sys_get_temp_dir();
+        if ($tmp !== '/' && !in_array($tmp, $paths, true)) {
+            $paths[] = $tmp;
+        }
+
+        // DOCUMENT_ROOT if available (web environments)
+        if (!empty($_SERVER['DOCUMENT_ROOT'])) {
+            $docRoot = $_SERVER['DOCUMENT_ROOT'];
+            if (!in_array($docRoot, $paths, true)) {
+                $paths[] = $docRoot;
+            }
+        }
+
+        // WordPress ABSPATH if defined
+        if (defined('ABSPATH') && !in_array(ABSPATH, $paths, true)) {
+            $paths[] = ABSPATH;
+        }
+
+        return $paths;
+    }
+
+    /**
+     * Fallback: get disk usage via shell_exec commands.
+     *
+     * @return array{total: float, used: float, percent: float, path: string}|null
+     */
+    private function getDiskUsageFromCommand(): ?array
+    {
+        if (PHP_OS_FAMILY === 'Windows') {
+            // wmic logicaldisk — works on Windows 7+/Server 2008+
+            $output = @shell_exec('wmic logicaldisk where "DriveType=3" get Size,FreeSpace /value 2>NUL');
+            if ($output !== null) {
+                $size = null;
+                $free = null;
+                if (preg_match('/Size=(\d+)/', $output, $ms)) {
+                    $size = (float) $ms[1];
+                }
+                if (preg_match('/FreeSpace=(\d+)/', $output, $mf)) {
+                    $free = (float) $mf[1];
+                }
+                if ($size !== null && $size > 0 && $free !== null) {
+                    $used = max(0, $size - $free);
+                    return [
+                        'total'   => round($size / 1073741824, 2),
+                        'used'    => round($used / 1073741824, 2),
+                        'percent' => round(($used / $size) * 100, 2),
+                        'path'    => 'wmic',
+                    ];
+                }
+            }
+
+            // PowerShell fallback for newer Windows without wmic
+            $output = @shell_exec('powershell -NoProfile -Command "Get-PSDrive C | Select-Object Used,Free | Format-List" 2>NUL');
+            if ($output !== null && preg_match('/Used\s*:\s*(\d+)/', $output, $mu) && preg_match('/Free\s*:\s*(\d+)/', $output, $mf)) {
+                $used = (float) $mu[1];
+                $free = (float) $mf[1];
+                $total = $used + $free;
+                if ($total > 0) {
+                    return [
+                        'total'   => round($total / 1073741824, 2),
+                        'used'    => round($used / 1073741824, 2),
+                        'percent' => round(($used / $total) * 100, 2),
+                        'path'    => 'powershell',
+                    ];
+                }
+            }
+
+            return null;
+        }
+
+        // Unix/Linux/macOS: df command (POSIX standard)
+        $output = @shell_exec('df -k / 2>/dev/null | tail -1');
+        if ($output !== null) {
+            // df -k output: Filesystem 1K-blocks Used Available Use% Mounted
+            $parts = preg_split('/\s+/', trim($output));
+            if ($parts !== false && count($parts) >= 4) {
+                $totalKb = (float) $parts[1];
+                $usedKb  = (float) $parts[2];
+                if ($totalKb > 0) {
+                    return [
+                        'total'   => round(($totalKb * 1024) / 1073741824, 2),
+                        'used'    => round(($usedKb * 1024) / 1073741824, 2),
+                        'percent' => round(($usedKb / $totalKb) * 100, 2),
+                        'path'    => 'df:/',
+                    ];
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Fallback: get disk usage via exec() when shell_exec is disabled.
+     *
+     * @return array{total: float, used: float, percent: float, path: string}|null
+     */
+    private function getDiskUsageFromExec(): ?array
+    {
+        $output = [];
+        $returnCode = -1;
+
+        if (PHP_OS_FAMILY === 'Windows') {
+            @exec('wmic logicaldisk where "DriveType=3" get Size,FreeSpace /value 2>NUL', $output, $returnCode);
+            if ($returnCode === 0 && !empty($output)) {
+                $raw = implode("\n", $output);
+                $size = null;
+                $free = null;
+                if (preg_match('/Size=(\d+)/', $raw, $ms)) {
+                    $size = (float) $ms[1];
+                }
+                if (preg_match('/FreeSpace=(\d+)/', $raw, $mf)) {
+                    $free = (float) $mf[1];
+                }
+                if ($size !== null && $size > 0 && $free !== null) {
+                    $used = max(0, $size - $free);
+                    return [
+                        'total'   => round($size / 1073741824, 2),
+                        'used'    => round($used / 1073741824, 2),
+                        'percent' => round(($used / $size) * 100, 2),
+                        'path'    => 'exec:wmic',
+                    ];
+                }
+            }
+        } else {
+            @exec('df -k / 2>/dev/null | tail -1', $output, $returnCode);
+            if ($returnCode === 0 && !empty($output)) {
+                $parts = preg_split('/\s+/', trim($output[0]));
+                if ($parts !== false && count($parts) >= 4) {
+                    $totalKb = (float) $parts[1];
+                    $usedKb  = (float) $parts[2];
+                    if ($totalKb > 0) {
+                        return [
+                            'total'   => round(($totalKb * 1024) / 1073741824, 2),
+                            'used'    => round(($usedKb * 1024) / 1073741824, 2),
+                            'percent' => round(($usedKb / $totalKb) * 100, 2),
+                            'path'    => 'exec:df',
+                        ];
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Extract Windows drive letter with trailing backslash (e.g., "C:\").
+     */
+    private function extractDriveLetter(string $path): string
+    {
+        $normalized = str_replace('/', '\\', $path);
+        if (preg_match('/^([A-Z]:)/i', $normalized, $m)) {
+            return strtoupper($m[1]) . '\\';
+        }
+        return '';
+    }
+
+    /**
+     * Get list of disabled PHP functions.
+     *
+     * @return array<string>
+     */
+    private function getDisabledFunctions(): array
+    {
+        $disabled = ini_get('disable_functions');
+        if ($disabled === false || $disabled === '') {
+            return [];
+        }
+        return array_map('trim', explode(',', $disabled));
     }
 
     private function getWindowsDiskRoot(): string
     {
-        $path = defined('ABSPATH') ? ABSPATH : (__DIR__ . '/');
-        if (preg_match('/^([A-Z]:)/i', str_replace('/', '\\', $path), $m)) {
-            return $m[1] . '\\';
+        // Try multiple sources to find the correct drive
+        $candidates = [];
+
+        if (defined('ABSPATH')) {
+            $candidates[] = ABSPATH;
         }
-        return 'C:';
+        $candidates[] = __DIR__;
+        $candidates[] = getcwd() ?: '';
+        $candidates[] = sys_get_temp_dir();
+
+        foreach ($candidates as $path) {
+            $drive = $this->extractDriveLetter($path);
+            if ($drive !== '') {
+                return $drive;
+            }
+        }
+
+        return 'C:\\';
     }
 
     /**
@@ -327,31 +641,31 @@ class SystemCollector
     private function getServerMemory(): array
     {
         $result = ['total' => null, 'used' => null, 'free' => null];
+        $disabled = $this->getDisabledFunctions();
 
-        // Linux: try /proc/meminfo first, then 'free' command
+        // Linux: try /proc/meminfo directly (don't pre-check open_basedir — kernel
+        // virtual files are often accessible even when not listed in open_basedir)
         if (PHP_OS_FAMILY === 'Linux') {
-            if ($this->safeIsReadable('/proc/meminfo')) {
-                $lines = @file('/proc/meminfo', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-                if ($lines !== false) {
-                    $values = [];
-                    foreach ($lines as $line) {
-                        if (preg_match('/^([A-Za-z_()]+):\s+(\d+)\s+kB$/', $line, $matches)) {
-                            $values[$matches[1]] = (int) $matches[2] * 1024;
-                        }
+            $lines = @file('/proc/meminfo', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            if ($lines !== false) {
+                $values = [];
+                foreach ($lines as $line) {
+                    if (preg_match('/^([A-Za-z_()]+):\s+(\d+)\s+kB$/', $line, $matches)) {
+                        $values[$matches[1]] = (int) $matches[2] * 1024;
                     }
-                    $total     = $values['MemTotal'] ?? null;
-                    $available = $values['MemAvailable'] ?? (($values['MemFree'] ?? 0) + ($values['Buffers'] ?? 0) + ($values['Cached'] ?? 0));
-                    if ($total !== null) {
-                        $result['total'] = $total;
-                        $result['free']  = $available;
-                        $result['used']  = max(0, $total - $available);
-                    }
-                    return $result;
                 }
+                $total     = $values['MemTotal'] ?? null;
+                $available = $values['MemAvailable'] ?? (($values['MemFree'] ?? 0) + ($values['Buffers'] ?? 0) + ($values['Cached'] ?? 0));
+                if ($total !== null) {
+                    $result['total'] = $total;
+                    $result['free']  = $available;
+                    $result['used']  = max(0, $total - $available);
+                }
+                return $result;
             }
 
-            // Fallback: 'free' command (no file access needed)
-            if (function_exists('shell_exec')) {
+            // Fallback: 'free' command
+            if (function_exists('shell_exec') && !in_array('shell_exec', $disabled, true)) {
                 $output = @shell_exec('free -b 2>/dev/null | head -2 | tail -1');
                 if ($output !== null && preg_match('/\S+\s+(\d+)\s+(\d+)\s+(\d+)/', $output, $m)) {
                     $result['total'] = (int) $m[1];
@@ -360,38 +674,91 @@ class SystemCollector
                     return $result;
                 }
             }
+
+            // Fallback: exec()
+            if (function_exists('exec') && !in_array('exec', $disabled, true)) {
+                $output = [];
+                @exec('free -b 2>/dev/null | head -2 | tail -1', $output);
+                if (!empty($output) && preg_match('/\S+\s+(\d+)\s+(\d+)\s+(\d+)/', $output[0], $m)) {
+                    $result['total'] = (int) $m[1];
+                    $result['used']  = (int) $m[2];
+                    $result['free']  = (int) $m[3];
+                    return $result;
+                }
+            }
         }
 
-        // Windows: wmic
-        if (PHP_OS_FAMILY === 'Windows' && function_exists('shell_exec')) {
-            $totalOut = @shell_exec('wmic ComputerSystem get TotalPhysicalMemory /value 2>NUL');
-            $freeOut  = @shell_exec('wmic OS get FreePhysicalMemory /value 2>NUL');
-            if ($totalOut !== null && preg_match('/TotalPhysicalMemory=(\d+)/', $totalOut, $mt)) {
-                $result['total'] = (int) $mt[1];
-            }
-            if ($freeOut !== null && preg_match('/FreePhysicalMemory=(\d+)/', $freeOut, $mf)) {
-                $result['free'] = (int) $mf[1] * 1024;
+        // Windows: wmic then PowerShell fallback
+        if (PHP_OS_FAMILY === 'Windows') {
+            if (function_exists('shell_exec') && !in_array('shell_exec', $disabled, true)) {
+                $totalOut = @shell_exec('wmic ComputerSystem get TotalPhysicalMemory /value 2>NUL');
+                $freeOut  = @shell_exec('wmic OS get FreePhysicalMemory /value 2>NUL');
+                if ($totalOut !== null && preg_match('/TotalPhysicalMemory=(\d+)/', $totalOut, $mt)) {
+                    $result['total'] = (int) $mt[1];
+                }
+                if ($freeOut !== null && preg_match('/FreePhysicalMemory=(\d+)/', $freeOut, $mf)) {
+                    $result['free'] = (int) $mf[1] * 1024;
+                    if ($result['total'] !== null) {
+                        $result['used'] = max(0, $result['total'] - $result['free']);
+                    }
+                }
                 if ($result['total'] !== null) {
-                    $result['used'] = max(0, $result['total'] - $result['free']);
+                    return $result;
                 }
+
+                // PowerShell fallback
+                $psOut = @shell_exec('powershell -NoProfile -Command "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory | Format-List" 2>NUL');
+                if ($psOut !== null) {
+                    if (preg_match('/TotalVisibleMemorySize\s*:\s*(\d+)/', $psOut, $mt)) {
+                        $result['total'] = (int) $mt[1] * 1024; // kB to bytes
+                    }
+                    if (preg_match('/FreePhysicalMemory\s*:\s*(\d+)/', $psOut, $mf)) {
+                        $result['free'] = (int) $mf[1] * 1024;
+                        if ($result['total'] !== null) {
+                            $result['used'] = max(0, $result['total'] - $result['free']);
+                        }
+                    }
+                }
+                return $result;
             }
-            return $result;
+
+            // exec() fallback for Windows
+            if (function_exists('exec') && !in_array('exec', $disabled, true)) {
+                $output = [];
+                @exec('wmic ComputerSystem get TotalPhysicalMemory /value 2>NUL', $output);
+                $raw = implode("\n", $output);
+                if (preg_match('/TotalPhysicalMemory=(\d+)/', $raw, $mt)) {
+                    $result['total'] = (int) $mt[1];
+                }
+                $output = [];
+                @exec('wmic OS get FreePhysicalMemory /value 2>NUL', $output);
+                $raw = implode("\n", $output);
+                if (preg_match('/FreePhysicalMemory=(\d+)/', $raw, $mf)) {
+                    $result['free'] = (int) $mf[1] * 1024;
+                    if ($result['total'] !== null) {
+                        $result['used'] = max(0, $result['total'] - $result['free']);
+                    }
+                }
+                return $result;
+            }
         }
 
-        // macOS: sysctl
-        if (PHP_OS_FAMILY === 'Darwin' && function_exists('shell_exec')) {
-            $totalOut = @shell_exec('sysctl -n hw.memsize 2>/dev/null');
-            if ($totalOut !== null) {
-                $result['total'] = (int) trim($totalOut);
-                $vmOut = @shell_exec('vm_stat 2>/dev/null');
-                if ($vmOut !== null && preg_match('/Pages free:\s+(\d+)/', $vmOut, $mf)) {
-                    $pageSize = 4096;
-                    $freePages = (int) $mf[1];
-                    $result['free'] = $freePages * $pageSize;
-                    $result['used'] = max(0, $result['total'] - $result['free']);
+        // macOS: sysctl + vm_stat
+        if (PHP_OS_FAMILY === 'Darwin') {
+            if (function_exists('shell_exec') && !in_array('shell_exec', $disabled, true)) {
+                $totalOut = @shell_exec('sysctl -n hw.memsize 2>/dev/null');
+                if ($totalOut !== null) {
+                    $result['total'] = (int) trim($totalOut);
+                    $vmOut = @shell_exec('vm_stat 2>/dev/null');
+                    if ($vmOut !== null && preg_match('/Pages free:\s+(\d+)/', $vmOut, $mf)) {
+                        $pageSize = 4096;
+                        $freePages = (int) $mf[1];
+                        $result['free'] = $freePages * $pageSize;
+                        $result['used'] = max(0, $result['total'] - $result['free']);
+                    }
                 }
+                return $result;
             }
-            return $result;
         }
 
         return $result;
@@ -432,8 +799,8 @@ class SystemCollector
     private function getOsInfo(): array
     {
         try {
-            // Linux: parse /etc/os-release (only if accessible)
-            if (PHP_OS_FAMILY === 'Linux' && $this->safeIsReadable('/etc/os-release')) {
+            // Linux: parse /etc/os-release (try directly — @ suppresses errors)
+            if (PHP_OS_FAMILY === 'Linux') {
                 $content = @file_get_contents('/etc/os-release');
                 if ($content !== false) {
                     $name = 'Linux';
