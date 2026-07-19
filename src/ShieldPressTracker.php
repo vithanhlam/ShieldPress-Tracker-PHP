@@ -10,6 +10,9 @@ use ShieldPress\Tracker\Collectors\ErrorCollector;
 use ShieldPress\Tracker\Collectors\SecurityCollector;
 use ShieldPress\Tracker\Collectors\EnvSecurityCollector;
 use ShieldPress\Tracker\Collectors\RuntimeCollector;
+use ShieldPress\Tracker\Collectors\DatabaseCollector;
+use ShieldPress\Tracker\Collectors\CacheCollector;
+use ShieldPress\Tracker\Collectors\ExternalHttpCollector;
 
 class ShieldPressTracker
 {
@@ -40,6 +43,15 @@ class ShieldPressTracker
     /** @var RuntimeCollector */
     private $runtimeCollector;
 
+    /** @var DatabaseCollector */
+    public $databaseCollector;
+
+    /** @var CacheCollector */
+    public $cacheCollector;
+
+    /** @var ExternalHttpCollector */
+    public $externalHttpCollector;
+
     /** @var bool */
     private $started = false;
 
@@ -57,12 +69,21 @@ class ShieldPressTracker
         $this->config               = new Config($config);
         $this->logger               = new Logger($this->config->debug);
         $this->reporter             = new Reporter($this->config->apiUrl, $this->config->apiKey, $this->logger);
-        $this->httpCollector        = new HttpCollector();
-        $this->errorCollector       = new ErrorCollector($this->config->maxErrorBuffer);
-        $this->securityCollector    = new SecurityCollector($this->config->maxSecurityBuffer);
-        $this->systemCollector      = new SystemCollector();
-        $this->envSecurityCollector = new EnvSecurityCollector();
-        $this->runtimeCollector     = new RuntimeCollector();
+        $this->httpCollector         = new HttpCollector();
+        $this->errorCollector        = new ErrorCollector($this->config->maxErrorBuffer);
+        $this->securityCollector     = new SecurityCollector($this->config->maxSecurityBuffer);
+        $this->systemCollector       = new SystemCollector();
+        $this->envSecurityCollector  = new EnvSecurityCollector();
+        $this->runtimeCollector      = new RuntimeCollector();
+        $this->databaseCollector     = new DatabaseCollector(
+            (float) ($config['db_slow_threshold_ms'] ?? 100.0),
+            (int) ($config['db_max_buffer'] ?? 500)
+        );
+        $this->cacheCollector        = new CacheCollector();
+        $this->externalHttpCollector = new ExternalHttpCollector(
+            (float) ($config['external_http_slow_threshold_ms'] ?? 1000.0),
+            (int) ($config['external_http_max_buffer'] ?? 200)
+        );
     }
 
     /**
@@ -139,6 +160,47 @@ class ShieldPressTracker
     {
         if (!$this->config->securityTracking) return;
         $this->securityCollector->recordRateLimit($ip, $url, $method, $limit);
+    }
+
+    /**
+     * Record a database query (for Laravel DB::listen, Doctrine, PDO wrappers).
+     *
+     * @param string $sql        SQL query (truncated to 500 chars internally)
+     * @param float  $durationMs Execution time in ms
+     * @param string $connection Connection name
+     */
+    public function recordQuery(string $sql, float $durationMs, string $connection = 'default'): void
+    {
+        $this->databaseCollector->record($sql, $durationMs, $connection);
+    }
+
+    /**
+     * Record a cache hit.
+     */
+    public function recordCacheHit(string $store = 'default'): void
+    {
+        $this->cacheCollector->recordHit($store);
+    }
+
+    /**
+     * Record a cache miss.
+     */
+    public function recordCacheMiss(string $store = 'default'): void
+    {
+        $this->cacheCollector->recordMiss($store);
+    }
+
+    /**
+     * Record an outgoing HTTP call (Guzzle, cURL to 3rd party APIs).
+     *
+     * @param string $url        Target URL
+     * @param string $method     HTTP method
+     * @param int    $statusCode Response code (0 for timeout)
+     * @param float  $durationMs Round-trip time in ms
+     */
+    public function recordExternalHttp(string $url, string $method, int $statusCode, float $durationMs): void
+    {
+        $this->externalHttpCollector->record($url, $method, $statusCode, $durationMs);
     }
 
     /**
@@ -224,9 +286,51 @@ class ShieldPressTracker
                 }
             }
 
+            // Database metrics
+            try {
+                $db = $this->databaseCollector->flush();
+                if ($db !== null) {
+                    $payload['database'] = $db;
+                }
+            } catch (\Throwable $e) {
+                // Skip database metrics on error
+            }
+
+            // Cache metrics
+            try {
+                $cache = $this->cacheCollector->flush();
+                if ($cache !== null) {
+                    $payload['cache'] = $cache;
+                }
+            } catch (\Throwable $e) {
+                // Skip cache metrics on error
+            }
+
+            // External HTTP calls
+            try {
+                $extHttp = $this->externalHttpCollector->flush();
+                if ($extHttp !== null) {
+                    $payload['externalHttp'] = $extHttp;
+                }
+            } catch (\Throwable $e) {
+                // Skip external http metrics on error
+            }
+
             if ($this->config->heartbeat) {
                 $payload['heartbeat'] = true;
             }
+
+            // Flush diagnostics
+            $payloadJson = json_encode($payload);
+            $payloadSize = $payloadJson !== false ? strlen($payloadJson) : 0;
+            $this->logger->info("Flush: system=" . (isset($payload['system']) ? 'yes' : 'no')
+                . " http=" . (isset($payload['http']) ? 'yes' : 'no')
+                . " errors=" . (isset($payload['errors']) ? count($payload['errors']) : 0)
+                . " db=" . (isset($payload['database']) ? ($payload['database']['totalQueries'] ?? 0) . 'q' : 'no')
+                . " cache=" . (isset($payload['cache']) ? 'yes' : 'no')
+                . " extHttp=" . (isset($payload['externalHttp']) ? ($payload['externalHttp']['totalCalls'] ?? 0) . ' calls' : 'no')
+                . " size=" . round($payloadSize / 1024, 1) . "KB"
+            );
 
             return $this->reporter->send($payload);
         } catch (\Throwable $e) {
