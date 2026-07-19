@@ -39,7 +39,7 @@ class SystemCollector
                 'diskUsedGb'       => 0.0,
                 'diskTotalGb'      => 0.0,
                 'diskPercent'      => 0.0,
-                // Server RAM (total system memory, not just PHP)
+                // Server RAM
                 'serverMemTotalMb' => null,
                 'serverMemUsedMb'  => null,
                 'serverMemFreeMb'  => null,
@@ -57,13 +57,12 @@ class SystemCollector
                 '_errors'          => [],
             ];
 
-            // Server RAM (system-wide, not PHP process)
+            // Server RAM
             $serverMem = $this->getServerMemory();
             if ($serverMem['total'] !== null) {
                 $metrics['serverMemTotalMb'] = round($serverMem['total'] / 1048576, 2);
                 $metrics['serverMemUsedMb']  = $serverMem['used'] !== null ? round($serverMem['used'] / 1048576, 2) : null;
                 $metrics['serverMemFreeMb']  = $serverMem['free'] !== null ? round($serverMem['free'] / 1048576, 2) : null;
-                // memPercent = server RAM usage (not PHP limit)
                 if ($serverMem['total'] > 0 && $serverMem['used'] !== null) {
                     $metrics['memPercent'] = round(($serverMem['used'] / $serverMem['total']) * 100, 2);
                 }
@@ -76,7 +75,7 @@ class SystemCollector
                 $errors[] = 'server_memory_unavailable';
             }
 
-            // CPU load average (Linux/Mac)
+            // CPU load average
             if (function_exists('sys_getloadavg')) {
                 $load = @sys_getloadavg();
                 if ($load !== false) {
@@ -96,7 +95,6 @@ class SystemCollector
                 $cpuPercent = $this->getWindowsCpuPercent();
             }
             if ($cpuPercent <= 0.0 && isset($metrics['loadAvg'][0]) && $cpuCount > 0) {
-                // Fallback: estimate from load average
                 $cpuPercent = round(min(100, ($metrics['loadAvg'][0] / $cpuCount) * 100), 2);
             }
             $metrics['cpuPercent'] = $cpuPercent;
@@ -104,17 +102,31 @@ class SystemCollector
                 $errors[] = 'cpu_percent_unavailable';
             }
 
-            // Disk usage
-            $root = PHP_OS_FAMILY === 'Windows' ? $this->getWindowsDiskRoot() : '/';
-            $diskTotal = @disk_total_space($root);
-            $diskFree  = @disk_free_space($root);
-            if ($diskTotal && $diskFree) {
-                $diskUsed = $diskTotal - $diskFree;
+            // Disk usage — try multiple paths for open_basedir compatibility
+            $diskPaths = PHP_OS_FAMILY === 'Windows'
+                ? [$this->getWindowsDiskRoot()]
+                : ['/', __DIR__, sys_get_temp_dir()];
+
+            $diskTotal = false;
+            $diskFree  = false;
+            foreach ($diskPaths as $tryPath) {
+                if (!$this->isPathAllowed($tryPath)) {
+                    continue;
+                }
+                $diskTotal = @disk_total_space($tryPath);
+                $diskFree  = @disk_free_space($tryPath);
+                if ($diskTotal !== false && $diskFree !== false) {
+                    break;
+                }
+            }
+
+            if ($diskTotal !== false && $diskFree !== false) {
+                $diskUsed = max(0, $diskTotal - $diskFree);
                 $metrics['diskTotalGb'] = round($diskTotal / 1073741824, 2);
                 $metrics['diskUsedGb']  = round($diskUsed / 1073741824, 2);
-                $metrics['diskPercent'] = round(($diskUsed / $diskTotal) * 100, 2);
+                $metrics['diskPercent'] = $diskTotal > 0 ? round(($diskUsed / $diskTotal) * 100, 2) : 0.0;
             } else {
-                $errors[] = 'disk_space_unavailable:path=' . $root;
+                $errors[] = 'disk_space_unavailable';
             }
 
             // OPcache hit rate
@@ -137,6 +149,47 @@ class SystemCollector
         }
     }
 
+    // ─── Helpers ─────────────────────────────────────────────────
+
+    /**
+     * Check if a path is allowed by open_basedir.
+     * Prevents warnings/errors when accessing restricted paths.
+     */
+    private function isPathAllowed(string $path): bool
+    {
+        $openBasedir = ini_get('open_basedir');
+        if ($openBasedir === false || $openBasedir === '') {
+            return true; // no restriction
+        }
+
+        $separator = PHP_OS_FAMILY === 'Windows' ? ';' : ':';
+        $allowed = explode($separator, $openBasedir);
+
+        foreach ($allowed as $dir) {
+            $dir = rtrim($dir, '/\\');
+            if ($dir === '' || $path === $dir || strpos($path, $dir . '/') === 0 || strpos($path, $dir . '\\') === 0) {
+                return true;
+            }
+            // Check if allowed dir is within the path (e.g., path='/' allows everything)
+            if ($path === '/') {
+                return true; // root is technically a parent of all allowed dirs
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Safely check if a file is readable (open_basedir aware).
+     */
+    private function safeIsReadable(string $path): bool
+    {
+        if (!$this->isPathAllowed($path)) {
+            return false;
+        }
+        return @is_readable($path);
+    }
+
     private function getMemoryLimitMb(): float
     {
         $limit = ini_get('memory_limit');
@@ -147,7 +200,6 @@ class SystemCollector
         $value = (int) $limit;
         $unit  = strtolower(substr($limit, -1));
 
-        // PHP 7.4 compat: replaced match() with switch
         switch ($unit) {
             case 'g':
                 return $value * 1024;
@@ -162,24 +214,42 @@ class SystemCollector
 
     private function getCpuCount(): int
     {
-        if (PHP_OS_FAMILY === 'Linux') {
+        // ENV var (works everywhere, no file access needed)
+        $envCores = getenv('NUMBER_OF_PROCESSORS');
+        if ($envCores !== false && (int) $envCores > 0) {
+            return (int) $envCores;
+        }
+        $envCores = $_ENV['NUMBER_OF_PROCESSORS'] ?? null;
+        if ($envCores !== null && (int) $envCores > 0) {
+            return (int) $envCores;
+        }
+
+        // nproc command (most reliable on Linux, no file access)
+        if (PHP_OS_FAMILY === 'Linux' && function_exists('shell_exec')) {
+            $output = @shell_exec('nproc 2>/dev/null');
+            if ($output !== null && (int) trim($output) > 0) {
+                return (int) trim($output);
+            }
+        }
+
+        if (PHP_OS_FAMILY === 'Linux' && $this->safeIsReadable('/proc/cpuinfo')) {
             $cpuinfo = @file_get_contents('/proc/cpuinfo');
             if ($cpuinfo !== false) {
                 return max(1, substr_count($cpuinfo, 'processor'));
             }
         }
 
-        if (PHP_OS_FAMILY === 'Darwin') {
+        if (PHP_OS_FAMILY === 'Darwin' && function_exists('shell_exec')) {
             $output = @shell_exec('sysctl -n hw.ncpu 2>/dev/null');
             if ($output !== null) {
                 return max(1, (int) trim($output));
             }
         }
 
-        if (PHP_OS_FAMILY === 'Windows') {
-            $cores = $_ENV['NUMBER_OF_PROCESSORS'] ?? null;
-            if ($cores !== null) {
-                return max(1, (int) $cores);
+        if (PHP_OS_FAMILY === 'Windows' && function_exists('shell_exec')) {
+            $output = @shell_exec('wmic cpu get NumberOfLogicalProcessors /value 2>NUL');
+            if ($output !== null && preg_match('/NumberOfLogicalProcessors=(\d+)/', $output, $m)) {
+                return max(1, (int) $m[1]);
             }
         }
 
@@ -192,34 +262,42 @@ class SystemCollector
             return 0.0;
         }
 
-        $stat = @file_get_contents('/proc/stat');
-        if ($stat === false) {
-            return 0.0;
+        // Try /proc/stat first
+        if ($this->safeIsReadable('/proc/stat')) {
+            $stat = @file_get_contents('/proc/stat');
+            if ($stat !== false) {
+                $lines = explode("\n", $stat);
+                foreach ($lines as $line) {
+                    if (strpos($line, 'cpu ') === 0) {
+                        $parts = preg_split('/\s+/', trim($line));
+                        if ($parts === false || count($parts) < 5) {
+                            return 0.0;
+                        }
+                        $busy  = (int) $parts[1] + (int) $parts[2] + (int) $parts[3];
+                        $idle  = (int) $parts[4];
+                        $total = $busy + $idle;
+                        if ($total === 0) {
+                            return 0.0;
+                        }
+                        return round(($busy / $total) * 100, 2);
+                    }
+                }
+            }
         }
 
-        $lines = explode("\n", $stat);
-        foreach ($lines as $line) {
-            if (strpos($line, 'cpu ') === 0) {
-                $parts = preg_split('/\s+/', trim($line));
-                if ($parts === false || count($parts) < 5) {
-                    return 0.0;
-                }
-                $busy  = (int) $parts[1] + (int) $parts[2] + (int) $parts[3];
-                $idle  = (int) $parts[4];
-                $total = $busy + $idle;
-                if ($total === 0) {
-                    return 0.0;
-                }
-                return round(($busy / $total) * 100, 2);
+        // Fallback: use 'top' or 'mpstat' command
+        if (function_exists('shell_exec')) {
+            // Try mpstat
+            $output = @shell_exec('mpstat 1 1 2>/dev/null | tail -1');
+            if ($output !== null && preg_match('/([\d.]+)\s*$/', trim($output), $m)) {
+                $idle = (float) $m[1];
+                return round(100 - $idle, 2);
             }
         }
 
         return 0.0;
     }
 
-    /**
-     * Get CPU usage on Windows via wmic.
-     */
     private function getWindowsCpuPercent(): float
     {
         if (!function_exists('shell_exec')) {
@@ -232,9 +310,6 @@ class SystemCollector
         return 0.0;
     }
 
-    /**
-     * Get the Windows drive root from the current script location.
-     */
     private function getWindowsDiskRoot(): string
     {
         $path = defined('ABSPATH') ? ABSPATH : (__DIR__ . '/');
@@ -253,24 +328,37 @@ class SystemCollector
     {
         $result = ['total' => null, 'used' => null, 'free' => null];
 
-        // Linux: /proc/meminfo
-        if (PHP_OS_FAMILY === 'Linux' && is_readable('/proc/meminfo')) {
-            $lines = @file('/proc/meminfo', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-            if ($lines !== false) {
-                $values = [];
-                foreach ($lines as $line) {
-                    if (preg_match('/^([A-Za-z_()]+):\s+(\d+)\s+kB$/', $line, $matches)) {
-                        $values[$matches[1]] = (int) $matches[2] * 1024; // convert kB to bytes
+        // Linux: try /proc/meminfo first, then 'free' command
+        if (PHP_OS_FAMILY === 'Linux') {
+            if ($this->safeIsReadable('/proc/meminfo')) {
+                $lines = @file('/proc/meminfo', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+                if ($lines !== false) {
+                    $values = [];
+                    foreach ($lines as $line) {
+                        if (preg_match('/^([A-Za-z_()]+):\s+(\d+)\s+kB$/', $line, $matches)) {
+                            $values[$matches[1]] = (int) $matches[2] * 1024;
+                        }
                     }
+                    $total     = $values['MemTotal'] ?? null;
+                    $available = $values['MemAvailable'] ?? (($values['MemFree'] ?? 0) + ($values['Buffers'] ?? 0) + ($values['Cached'] ?? 0));
+                    if ($total !== null) {
+                        $result['total'] = $total;
+                        $result['free']  = $available;
+                        $result['used']  = max(0, $total - $available);
+                    }
+                    return $result;
                 }
-                $total     = $values['MemTotal'] ?? null;
-                $available = $values['MemAvailable'] ?? (($values['MemFree'] ?? 0) + ($values['Buffers'] ?? 0) + ($values['Cached'] ?? 0));
-                if ($total !== null) {
-                    $result['total'] = $total;
-                    $result['free']  = $available;
-                    $result['used']  = max(0, $total - $available);
+            }
+
+            // Fallback: 'free' command (no file access needed)
+            if (function_exists('shell_exec')) {
+                $output = @shell_exec('free -b 2>/dev/null | head -2 | tail -1');
+                if ($output !== null && preg_match('/\S+\s+(\d+)\s+(\d+)\s+(\d+)/', $output, $m)) {
+                    $result['total'] = (int) $m[1];
+                    $result['used']  = (int) $m[2];
+                    $result['free']  = (int) $m[3];
+                    return $result;
                 }
-                return $result;
             }
         }
 
@@ -279,10 +367,10 @@ class SystemCollector
             $totalOut = @shell_exec('wmic ComputerSystem get TotalPhysicalMemory /value 2>NUL');
             $freeOut  = @shell_exec('wmic OS get FreePhysicalMemory /value 2>NUL');
             if ($totalOut !== null && preg_match('/TotalPhysicalMemory=(\d+)/', $totalOut, $mt)) {
-                $result['total'] = (int) $mt[1]; // already in bytes
+                $result['total'] = (int) $mt[1];
             }
             if ($freeOut !== null && preg_match('/FreePhysicalMemory=(\d+)/', $freeOut, $mf)) {
-                $result['free'] = (int) $mf[1] * 1024; // kB to bytes
+                $result['free'] = (int) $mf[1] * 1024;
                 if ($result['total'] !== null) {
                     $result['used'] = max(0, $result['total'] - $result['free']);
                 }
@@ -295,7 +383,6 @@ class SystemCollector
             $totalOut = @shell_exec('sysctl -n hw.memsize 2>/dev/null');
             if ($totalOut !== null) {
                 $result['total'] = (int) trim($totalOut);
-                // macOS free memory via vm_stat
                 $vmOut = @shell_exec('vm_stat 2>/dev/null');
                 if ($vmOut !== null && preg_match('/Pages free:\s+(\d+)/', $vmOut, $mf)) {
                     $pageSize = 4096;
@@ -339,15 +426,14 @@ class SystemCollector
 
     /**
      * Detect OS distro name and version.
-     * Parses /etc/os-release on Linux, falls back to php_uname().
      *
      * @return array{name: string, version: string}
      */
     private function getOsInfo(): array
     {
         try {
-            // Linux: parse /etc/os-release
-            if (PHP_OS_FAMILY === 'Linux' && is_readable('/etc/os-release')) {
+            // Linux: parse /etc/os-release (only if accessible)
+            if (PHP_OS_FAMILY === 'Linux' && $this->safeIsReadable('/etc/os-release')) {
                 $content = @file_get_contents('/etc/os-release');
                 if ($content !== false) {
                     $name = 'Linux';
@@ -364,9 +450,14 @@ class SystemCollector
                 }
             }
 
+            // Linux fallback: use uname
+            if (PHP_OS_FAMILY === 'Linux') {
+                return ['name' => 'Linux', 'version' => php_uname('r')];
+            }
+
             // macOS
             if (PHP_OS_FAMILY === 'Darwin') {
-                $version = @shell_exec('sw_vers -productVersion 2>/dev/null');
+                $version = function_exists('shell_exec') ? @shell_exec('sw_vers -productVersion 2>/dev/null') : null;
                 return [
                     'name' => 'macOS',
                     'version' => $version !== null ? trim($version) : '',
