@@ -456,7 +456,7 @@ class ShieldPressTracker
 
             // Call previous handler if exists
             if (is_callable($previousHandler)) {
-                return $previousHandler($errno, $errstr, $errfile, $errline);
+                return (bool) $previousHandler($errno, $errstr, $errfile, $errline);
             }
 
             return false; // Let PHP handle it normally

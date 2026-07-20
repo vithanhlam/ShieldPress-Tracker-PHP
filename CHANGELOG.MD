@@ -1,5 +1,12 @@
 # Changelog — shieldpress/tracker-php
 
+## [1.1.4] — 2026-07-20
+
+### Fixed
+- **PHP 8.4 compatibility**: Custom error handler closure declares `: bool` return type but called previous handler that could return `null`. Cast `$previousHandler()` result to `(bool)` to prevent fatal error on PHP 8.4 strict mode.
+
+---
+
 ## [1.1.3] — 2026-07-19
 
 ### Fixed
