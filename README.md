@@ -1,6 +1,19 @@
+<p align="center">
+  <a href="https://shieldpress.net/">
+    <img src="https://shieldpress.net/logo.png" alt="ShieldPress" width="500">
+  </a>
+</p>
+
+<p align="center">
+  <strong>Real-time website monitoring, security & performance tracking for PHP applications.</strong><br>
+  <a href="https://shieldpress.net/">Visit ShieldPress Dashboard →</a>
+</p>
+
 # shieldpress/tracker-php
 
-Lightweight monitoring, security & tracking SDK for PHP applications. Collects system metrics, HTTP performance, security threats, and runtime health — then reports them to your [ShieldPress](https://shieldpress.net) dashboard.
+A lightweight, zero-dependency SDK that monitors your PHP application in real time. It collects system metrics, HTTP performance data, security threats, and runtime health — then reports everything to your [ShieldPress](https://shieldpress.net) dashboard for visualization and alerting.
+
+> **Get started free** — sign up at [shieldpress.net](https://shieldpress.net/) to create your dashboard, then install this SDK to start monitoring.
 
 ## Features
 
@@ -10,6 +23,9 @@ Lightweight monitoring, security & tracking SDK for PHP applications. Collects s
 - **Security Monitoring** — SQL injection, XSS, command injection, path traversal, bot detection, brute-force
 - **Runtime Performance** — OPcache stats, memory peak, included files, realpath cache
 - **Environment Security** — PHP version EOL check, security headers, `display_errors`, `expose_php`, sensitive env vars
+- **Database Monitoring** — query count, slow queries, per-connection stats, top slowest queries
+- **Cache Monitoring** — hit/miss rates, Redis server info, memory usage, evicted keys
+- **External HTTP Tracking** — outgoing API calls, per-host stats, slow call detection
 - **Laravel Integration** — ServiceProvider, Middleware, config publishing
 - **Generic Middleware** — works with any PHP app (Slim, Symfony, vanilla PHP)
 - **Zero dependencies** — only requires `ext-json` and `ext-curl`
@@ -104,6 +120,11 @@ $app->add(function ($request, $handler) {
     return $response;
 });
 ```
+
+## Support
+
+- **Dashboard & Docs**: [shieldpress.net](https://shieldpress.net/)
+- **Issues**: [GitHub Issues](https://github.com/vithanhlam/ShieldPress-Tracker-PHP/issues)
 
 ## License
 
